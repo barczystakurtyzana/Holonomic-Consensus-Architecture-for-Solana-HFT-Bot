@@ -1,0 +1,546 @@
+use anyhow::{anyhow, Result};
+use parking_lot::{Mutex, RwLock};
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::{
+    hash::Hash,
+    instruction::Instruction,
+    message::Message,
+    pubkey::Pubkey,
+    signature::Keypair,
+    signer::Signer,
+    system_instruction,
+    transaction::Transaction,
+};
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, warn};
+
+/// State of a nonce account in the Quantum Race Architecture
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NonceState {
+    /// Ready for immediate use with fresh nonceHash
+    Available,
+    /// Used in a transaction batch, locked until confirmation or forced advance
+    InFlight,
+    /// Transaction confirmed, queued for NonceAdvance to become Available again
+    RequiresAdvance,
+}
+
+#[derive(Debug)]
+pub struct NonceData {
+    pub pubkey: Pubkey,
+    pub authority: Arc<Keypair>,
+    pub cached_nonce: RwLock<Option<Hash>>,
+    pub state: RwLock<NonceState>,
+    pub last_used: RwLock<Option<Instant>>,
+}
+
+/// The Ammunition Magazine - manages ready-to-use, independent transaction streams
+/// in the Quantum Race Architecture
+#[derive(Debug)]
+pub struct NonceManager {
+    pool: Vec<Arc<NonceData>>,
+    /// Atomowy licznik do implementacji strategii Round-Robin for available accounts
+    next_available_index: AtomicUsize,
+    /// Background task handle for auto-reloading (nonce advance)
+    reload_task_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Queue for accounts that require advance - using parking_lot for performance
+    advance_queue: Arc<Mutex<Vec<Arc<NonceData>>>>,
+}
+
+impl NonceManager {
+    /// Creates a NonceManager with non-seeded random nonce accounts
+    /// for the Quantum Race Architecture
+    pub fn new(nonce_count: usize) -> Result<Self> {
+        if nonce_count == 0 {
+            return Err(anyhow!("Nonce pool cannot be empty"));
+        }
+
+        let pool = (0..nonce_count)
+            .map(|_| {
+                // Create random authorities for each nonce (non-seeded)
+                let authority = Arc::new(Keypair::new());
+                let nonce_keypair = Keypair::new(); // Random nonce account
+                
+                Arc::new(NonceData {
+                    pubkey: nonce_keypair.pubkey(),
+                    authority,
+                    cached_nonce: RwLock::new(None),
+                    state: RwLock::new(NonceState::RequiresAdvance), // Start in advance state
+                    last_used: RwLock::new(None),
+                })
+            })
+            .collect();
+
+        info!("🎯 NonceManager initialized with {} non-seeded accounts", nonce_count);
+
+        Ok(Self {
+            pool,
+            next_available_index: AtomicUsize::new(0),
+            reload_task_handle: Mutex::new(None),
+            advance_queue: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    /// Backward compatibility constructor using seeds (legacy)
+    pub fn new_with_seeds(payer: &Keypair, nonce_seeds: &[String]) -> Result<Self> {
+        let pool = nonce_seeds
+            .iter()
+            .map(|seed| {
+                let authority = Arc::new(Keypair::new());
+                let pubkey = Pubkey::create_with_seed(
+                    &payer.pubkey(),
+                    seed,
+                    &solana_sdk::system_program::id(),
+                )
+                .map_err(|e| anyhow!("Failed to create nonce pubkey with seed {}: {}", seed, e))?;
+
+                Ok(Arc::new(NonceData {
+                    pubkey,
+                    authority,
+                    cached_nonce: RwLock::new(None),
+                    state: RwLock::new(NonceState::RequiresAdvance),
+                    last_used: RwLock::new(None),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if pool.is_empty() {
+            return Err(anyhow!("Nonce pool cannot be empty"));
+        }
+
+        info!("🎯 NonceManager initialized with {} seeded accounts (legacy mode)", pool.len());
+
+        Ok(Self {
+            pool,
+            next_available_index: AtomicUsize::new(0),
+            reload_task_handle: Mutex::new(None),
+            advance_queue: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    /// Starts the background auto-reloading loop for nonce advance
+    pub async fn start_auto_reload(&self, rpc_client: Arc<RpcClient>) {
+        let advance_queue = self.advance_queue.clone();
+        let pool = self.pool.clone();
+
+        let handle = tokio::spawn(async move {
+            info!("🔄 NonceManager auto-reload loop started");
+            let mut retry_delay = Duration::from_millis(100);
+            const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+            
+            loop {
+                // Safe drain of the advance queue outside of any lock
+                let accounts_to_advance = {
+                    let mut queue = advance_queue.lock();
+                    queue.drain(..).collect::<Vec<_>>()
+                };
+
+                if !accounts_to_advance.is_empty() {
+                    debug!("🔄 Processing {} accounts for advance", accounts_to_advance.len());
+                }
+
+                let mut failed_accounts = Vec::new();
+                
+                for nonce_data in accounts_to_advance {
+                    match Self::advance_nonce(&rpc_client, &nonce_data).await {
+                        Ok(()) => {
+                            // Success - reset retry delay
+                            retry_delay = Duration::from_millis(100);
+                        }
+                        Err(e) => {
+                            error!("Failed to advance nonce for {}: {}", nonce_data.pubkey, e);
+                            failed_accounts.push(nonce_data);
+                        }
+                    }
+                }
+
+                // Re-queue failed accounts for retry with exponential backoff
+                if !failed_accounts.is_empty() {
+                    {
+                        let mut queue = advance_queue.lock();
+                        queue.extend(failed_accounts);
+                    }
+                    
+                    // Apply exponential backoff with jitter
+                    let jitter = Duration::from_millis(fastrand::u64(0..50));
+                    tokio::time::sleep(retry_delay + jitter).await;
+                    
+                    // Increase delay for next time, but cap it
+                    retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                } else {
+                    // No failures, use normal delay
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+
+                // Check for any InFlight accounts that might be stuck and need forced advance
+                for nonce_data in &pool {
+                    let should_force_advance = {
+                        let state = nonce_data.state.read();
+                        if *state == NonceState::InFlight {
+                            if let Some(last_used) = *nonce_data.last_used.read() {
+                                // Force advance if stuck for more than 30 seconds
+                                last_used.elapsed() > Duration::from_secs(30)
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+
+                    if should_force_advance {
+                        warn!("🚨 Force advancing stuck nonce: {}", nonce_data.pubkey);
+                        let mut queue = advance_queue.lock();
+                        queue.push(nonce_data.clone());
+                    }
+                }
+            }
+        });
+
+        *self.reload_task_handle.lock() = Some(handle);
+    }
+
+    /// Request multiple available nonces for the Quantum Race
+    pub async fn request_available(&self, count: usize) -> Result<Vec<Arc<NonceData>>> {
+        let mut available_nonces = Vec::new();
+        let mut attempts = 0;
+        let max_attempts = self.pool.len() * 2; // Prevent infinite loops
+
+        while available_nonces.len() < count && attempts < max_attempts {
+            let index = self.next_available_index.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+            let nonce_data = &self.pool[index];
+            
+            // Try to transition from Available to InFlight atomically
+            // Use parking_lot locks for better performance - no await needed
+            {
+                let mut state = nonce_data.state.write();
+                if *state == NonceState::Available {
+                    *state = NonceState::InFlight;
+                    *nonce_data.last_used.write() = Some(Instant::now());
+                    available_nonces.push(nonce_data.clone());
+                    debug!("🎯 Acquired nonce {} for Quantum Race", nonce_data.pubkey);
+                }
+            }
+            
+            attempts += 1;
+        }
+
+        if available_nonces.len() < count {
+            warn!("⚠️ Could only acquire {}/{} requested nonces", available_nonces.len(), count);
+        }
+
+        info!("🚀 Quantum Race: Acquired {} ammunition units", available_nonces.len());
+        Ok(available_nonces)
+    }
+
+    /// Mark nonces as requiring advance after transaction confirmation
+    pub async fn mark_for_advance(&self, nonce_accounts: Vec<Arc<NonceData>>) {
+        let mut queue = self.advance_queue.lock();
+        
+        for nonce_data in nonce_accounts {
+            // Transition from InFlight to RequiresAdvance using parking_lot
+            {
+                let mut state = nonce_data.state.write();
+                if *state == NonceState::InFlight {
+                    *state = NonceState::RequiresAdvance;
+                    queue.push(nonce_data.clone());
+                    debug!("⏳ Nonce {} queued for advance", nonce_data.pubkey);
+                }
+            }
+        }
+        
+        info!("🔄 {} nonces queued for reload", queue.len());
+    }
+
+    /// Internal method to advance a nonce and update its state
+    async fn advance_nonce(
+        rpc_client: &RpcClient,
+        nonce_data: &NonceData,
+    ) -> Result<()> {
+        // Create nonce advance instruction
+        let advance_ix = system_instruction::advance_nonce_account(
+            &nonce_data.pubkey,
+            &nonce_data.authority.pubkey(),
+        );
+
+        // Get recent blockhash
+        let recent_blockhash = rpc_client.get_latest_blockhash().await?;
+
+        // Create and sign transaction
+        let message = Message::new(&[advance_ix], Some(&nonce_data.authority.pubkey()));
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction.sign(&[nonce_data.authority.as_ref()], recent_blockhash);
+
+        // Send transaction
+        let signature = rpc_client.send_and_confirm_transaction(&transaction).await?;
+        
+        // Fetch new nonce hash with proper parsing
+        let nonce_account = rpc_client.get_account(&nonce_data.pubkey).await?;
+        
+        // Parse the nonce account data properly
+        use solana_sdk::nonce::state::{Versions, State};
+        let nonce_hash = match bincode::deserialize::<Versions>(&nonce_account.data) {
+            Ok(Versions::Current(state)) => match *state {
+                State::Initialized(data) => data.blockhash(),
+                _ => return Err(anyhow!("Nonce account is not initialized")),
+            },
+            Ok(Versions::Legacy(_)) => {
+                // Handle legacy nonce format
+                warn!("Legacy nonce format detected, using fallback");
+                use solana_sdk::hash::{hash};
+                hash(&nonce_account.data)
+            },
+            Err(e) => {
+                warn!("Failed to parse nonce account data: {}, using fallback", e);
+                // Fallback to a hash derived from account data if parsing fails
+                use solana_sdk::hash::{hash};
+                hash(&nonce_account.data)
+            }
+        };
+
+        // Update state atomically using parking_lot locks (no await needed)
+        {
+            *nonce_data.cached_nonce.write() = Some(nonce_hash);
+            *nonce_data.state.write() = NonceState::Available;
+        }
+
+        debug!("✅ Nonce {} advanced successfully: {}", nonce_data.pubkey, signature);
+        Ok(())
+    }
+
+    /// Get current pool statistics for monitoring
+    pub fn get_stats(&self) -> HashMap<NonceState, usize> {
+        let mut stats = HashMap::new();
+        stats.insert(NonceState::Available, 0);
+        stats.insert(NonceState::InFlight, 0);
+        stats.insert(NonceState::RequiresAdvance, 0);
+
+        for nonce_data in &self.pool {
+            let state = nonce_data.state.read();
+            *stats.entry(state.clone()).or_insert(0) += 1;
+        }
+
+        stats
+    }
+
+    /// Legacy method for backward compatibility
+    pub fn acquire_nonce(&self) -> Arc<NonceData> {
+        let index = self.next_available_index.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+        self.pool[index].clone()
+    }
+
+    pub fn accounts(&self) -> &Vec<Arc<NonceData>> {
+        &self.pool
+    }
+}
+
+/// Type alias for backward compatibility
+pub type NoncePool = NonceManager;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::sleep;
+
+    #[tokio::test]
+    async fn test_nonce_manager_creation() {
+        let manager = NonceManager::new(3).unwrap();
+        assert_eq!(manager.pool.len(), 3);
+        
+        // All accounts should start in RequiresAdvance state
+        let stats = manager.get_stats();
+        assert_eq!(stats[&NonceState::RequiresAdvance], 3);
+        assert_eq!(stats[&NonceState::Available], 0);
+        assert_eq!(stats[&NonceState::InFlight], 0);
+    }
+
+    #[tokio::test]
+    async fn test_nonce_manager_empty_pool_fails() {
+        let result = NonceManager::new(0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_constructor_with_seeds() {
+        let payer = Keypair::new();
+        let seeds = vec!["seed1".to_string(), "seed2".to_string()];
+        
+        let manager = NonceManager::new_with_seeds(&payer, &seeds).unwrap();
+        assert_eq!(manager.pool.len(), 2);
+        
+        // Check that pubkeys are generated from seeds
+        for (i, nonce_data) in manager.pool.iter().enumerate() {
+            let expected_pubkey = Pubkey::create_with_seed(
+                &payer.pubkey(),
+                &seeds[i],
+                &solana_sdk::system_program::id(),
+            ).unwrap();
+            assert_eq!(nonce_data.pubkey, expected_pubkey);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_state_transitions() {
+        let manager = NonceManager::new(2).unwrap();
+        
+        // Manually set one account to Available for testing
+        {
+            *manager.pool[0].state.write() = NonceState::Available;
+        }
+        
+        // Request available nonces
+        let available = manager.request_available(1).await.unwrap();
+        assert_eq!(available.len(), 1);
+        
+        // The account should now be InFlight
+        {
+            let state = manager.pool[0].state.read();
+            assert_eq!(*state, NonceState::InFlight);
+        }
+        
+        // Mark for advance
+        manager.mark_for_advance(available).await;
+        
+        // The account should now be RequiresAdvance
+        {
+            let state = manager.pool[0].state.read();
+            assert_eq!(*state, NonceState::RequiresAdvance);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_available_with_insufficient_nonces() {
+        let manager = NonceManager::new(2).unwrap();
+        
+        // Set one account to Available
+        {
+            *manager.pool[0].state.write() = NonceState::Available;
+        }
+        
+        // Request more nonces than available
+        let available = manager.request_available(3).await.unwrap();
+        assert_eq!(available.len(), 1); // Only one was available
+        
+        let stats = manager.get_stats();
+        assert_eq!(stats[&NonceState::InFlight], 1);
+        assert_eq!(stats[&NonceState::RequiresAdvance], 1);
+        assert_eq!(stats[&NonceState::Available], 0);
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_acquisition() {
+        let manager = NonceManager::new(3).unwrap();
+        
+        // Set all accounts to Available
+        for nonce_data in &manager.pool {
+            *nonce_data.state.write() = NonceState::Available;
+        }
+        
+        // Request nonces one by one and verify round-robin behavior
+        let first = manager.request_available(1).await.unwrap();
+        let second = manager.request_available(1).await.unwrap();
+        let third = manager.request_available(1).await.unwrap();
+        
+        // All should be different accounts
+        assert_ne!(first[0].pubkey, second[0].pubkey);
+        assert_ne!(second[0].pubkey, third[0].pubkey);
+        assert_ne!(first[0].pubkey, third[0].pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_acquire_nonce() {
+        let manager = NonceManager::new(3).unwrap();
+        
+        let nonce1 = manager.acquire_nonce();
+        let nonce2 = manager.acquire_nonce();
+        
+        // Should return different accounts due to round-robin
+        assert_ne!(nonce1.pubkey, nonce2.pubkey);
+    }
+
+    #[test]
+    fn test_nonce_state_equality() {
+        assert_eq!(NonceState::Available, NonceState::Available);
+        assert_ne!(NonceState::Available, NonceState::InFlight);
+        assert_ne!(NonceState::InFlight, NonceState::RequiresAdvance);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_access() {
+        let manager = Arc::new(NonceManager::new(5).unwrap());
+        
+        // Set all to available
+        for nonce_data in &manager.pool {
+            *nonce_data.state.write() = NonceState::Available;
+        }
+        
+        // Spawn multiple concurrent tasks requesting nonces
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let manager_clone = manager.clone();
+            handles.push(tokio::spawn(async move {
+                manager_clone.request_available(2).await
+            }));
+        }
+        
+        // Wait for all tasks to complete
+        let results = futures::future::join_all(handles).await;
+        let total_acquired: usize = results.into_iter()
+            .map(|r| r.unwrap().unwrap().len())
+            .sum();
+        
+        // Should have acquired all 5 available nonces
+        assert_eq!(total_acquired, 5);
+        
+        let stats = manager.get_stats();
+        assert_eq!(stats[&NonceState::InFlight], 5);
+    }
+
+    #[tokio::test]
+    async fn test_last_used_timestamp() {
+        let manager = NonceManager::new(1).unwrap();
+        
+        {
+            *manager.pool[0].state.write() = NonceState::Available;
+        }
+        
+        let before = Instant::now();
+        let available = manager.request_available(1).await.unwrap();
+        let after = Instant::now();
+        
+        let last_used = *available[0].last_used.read();
+        assert!(last_used.is_some());
+        let timestamp = last_used.unwrap();
+        assert!(timestamp >= before && timestamp <= after);
+    }
+
+    #[tokio::test]
+    async fn test_advance_queue_operations() {
+        let manager = NonceManager::new(2).unwrap();
+        
+        // Set accounts to InFlight
+        for nonce_data in &manager.pool {
+            *nonce_data.state.write() = NonceState::InFlight;
+        }
+        
+        // Mark for advance
+        manager.mark_for_advance(manager.pool.clone()).await;
+        
+        // Check that queue is populated
+        {
+            let queue = manager.advance_queue.lock();
+            assert_eq!(queue.len(), 2);
+        }
+        
+        // All should be in RequiresAdvance state
+        let stats = manager.get_stats();
+        assert_eq!(stats[&NonceState::RequiresAdvance], 2);
+    }
+}
